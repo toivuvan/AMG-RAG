@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+new_VDB/
+results/
+artifacts/
+processing_log.log
+processed_files.log
