@@ -88,6 +88,67 @@ def keyword_tokens(text: str) -> set:
     return {token for token in tokens if token not in STOPWORDS}
 
 
+class HFTransformersChat:
+    def __init__(self, model: str):
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        self.model_id = model
+        self.max_new_tokens = int(config("HF_MAX_NEW_TOKENS", default="768"))
+        self.max_input_tokens = int(config("HF_MAX_INPUT_TOKENS", default="4096"))
+        self.tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+
+        load_kwargs = {
+            "device_map": config("HF_DEVICE_MAP", default="auto"),
+            "trust_remote_code": True,
+        }
+        if config("HF_LOAD_IN_4BIT", default="false").lower() in {"1", "true", "yes"}:
+            from transformers import BitsAndBytesConfig
+
+            load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_quant_type="nf4",
+            )
+        else:
+            load_kwargs["torch_dtype"] = torch.float16 if torch.cuda.is_available() else torch.float32
+
+        self.model = AutoModelForCausalLM.from_pretrained(model, **load_kwargs)
+        self.model.eval()
+
+    def invoke(self, prompt: str) -> str:
+        import torch
+
+        messages = [{"role": "user", "content": prompt}]
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            text = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        else:
+            text = prompt
+
+        inputs = self.tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=self.max_input_tokens,
+        )
+        inputs = {key: value.to(self.model.device) for key, value in inputs.items()}
+
+        with torch.inference_mode():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=False,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+
+        generated = outputs[0][inputs["input_ids"].shape[-1]:]
+        return self.tokenizer.decode(generated, skip_special_tokens=True).strip()
+
+
 class LLMFactory:
     @staticmethod
     def create(provider: str, model: str):
@@ -120,7 +181,9 @@ class LLMFactory:
             )
         if provider == "openai":
             return ChatOpenAI(model=model, temperature=0.0, api_key=config("OPENAI_API_KEY"))
-        raise ValueError("provider must be one of: gemini, openai, openai-compatible, openrouter, ollama")
+        if provider == "hf-transformers":
+            return HFTransformersChat(model)
+        raise ValueError("provider must be one of: gemini, hf-transformers, openai, openai-compatible, openrouter, ollama")
 
 
 class PubMedSearcher:
@@ -1198,7 +1261,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run one AMG KG-RAG question from a MEDQA JSONL file.")
     parser.add_argument("--input", default="data_clean/data_clean/questions/US/test.jsonl")
     parser.add_argument("--index", type=int, default=0)
-    parser.add_argument("--provider", choices=["gemini", "openai", "openai-compatible", "openrouter", "ollama"], default="ollama")
+    parser.add_argument("--provider", choices=["gemini", "hf-transformers", "openai", "openai-compatible", "openrouter", "ollama"], default="ollama")
     parser.add_argument("--model", default="llama3.1:8b")
     parser.add_argument("--mkg-path", default="artifacts/global_mkg.json")
     parser.add_argument("--no-pubmed", action="store_true")

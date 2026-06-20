@@ -65,7 +65,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run paper-inspired AMG KG-RAG on MEDQA-style JSONL data.")
     parser.add_argument("--input", default="data_clean/data_clean/questions/US/test.jsonl")
     parser.add_argument("--output", default="results/medqa_kg.csv")
-    parser.add_argument("--provider", choices=["gemini", "openai", "openai-compatible", "openrouter", "ollama"], default="ollama")
+    parser.add_argument("--provider", choices=["gemini", "hf-transformers", "openai", "openai-compatible", "openrouter", "ollama"], default="ollama")
     parser.add_argument("--model", default="llama3.1:8b")
     parser.add_argument("--mkg-path", default="artifacts/global_mkg.json")
     parser.add_argument("--limit", type=int, default=5, help="Use -1 for all questions.")

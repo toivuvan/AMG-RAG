@@ -7,6 +7,8 @@ langchain-ollama
 langgraph
 sentence-transformers
 transformers
+accelerate
+bitsandbytes
 chromadb
 pandas
 numpy
