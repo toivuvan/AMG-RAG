@@ -1,5 +1,6 @@
 import argparse
 import json
+import logging
 import os
 import re
 import time
@@ -72,6 +73,21 @@ def llm_text(response: Any) -> str:
     return getattr(response, "content", str(response))
 
 
+STOPWORDS = {
+    "the", "and", "for", "with", "from", "that", "this", "which", "following",
+    "patient", "patients", "history", "current", "most", "likely", "shows",
+    "show", "after", "before", "during", "because", "about", "into", "over",
+    "under", "than", "then", "been", "have", "has", "had", "his", "her",
+    "she", "him", "man", "woman", "year", "old", "day", "week", "month",
+    "blood", "pressure", "temperature", "pulse", "respirations", "normal",
+}
+
+
+def keyword_tokens(text: str) -> set:
+    tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9\-]{2,}", str(text).lower())
+    return {token for token in tokens if token not in STOPWORDS}
+
+
 class LLMFactory:
     @staticmethod
     def create(provider: str, model: str):
@@ -84,15 +100,38 @@ class LLMFactory:
                 api_key=config("OPENAI_API_KEY"),
                 base_url=config("OPENAI_BASE_URL"),
             )
+        if provider == "openrouter":
+            return ChatOpenAI(
+                model=model,
+                temperature=0.0,
+                api_key=config("OPENROUTER_API_KEY"),
+                base_url=config("OPENROUTER_BASE_URL", default="https://openrouter.ai/api/v1"),
+                default_headers={
+                    "HTTP-Referer": config("OPENROUTER_SITE_URL", default="http://localhost"),
+                    "X-Title": config("OPENROUTER_APP_NAME", default="AMG-RAG"),
+                },
+            )
+        if provider == "gemini":
+            return ChatOpenAI(
+                model=model,
+                temperature=0.0,
+                api_key=config("GEMINI_API_KEY"),
+                base_url=config("GEMINI_BASE_URL", default="https://generativelanguage.googleapis.com/v1beta/openai/"),
+            )
         if provider == "openai":
             return ChatOpenAI(model=model, temperature=0.0, api_key=config("OPENAI_API_KEY"))
-        raise ValueError("provider must be one of: openai, openai-compatible, ollama")
+        raise ValueError("provider must be one of: gemini, openai, openai-compatible, openrouter, ollama")
 
 
 class PubMedSearcher:
-    def __init__(self, api_key: str = ""):
+    def __init__(self, api_key: str = "", tool: str = "AMG_RAG_project", email: str = ""):
         self.api_key = api_key
+        self.tool = tool
+        self.email = email
         self.last_request_time = 0.0
+        self.headers = {
+            "User-Agent": f"{self.tool}/1.0 ({self.email or 'no-email-provided'})"
+        }
 
     def _throttle(self):
         elapsed = time.time() - self.last_request_time
@@ -105,21 +144,30 @@ class PubMedSearcher:
         search_params = {
             "db": "pubmed",
             "term": query,
-            "retmode": "xml",
+            "retmode": "json",
             "retmax": max_results,
+            "tool": self.tool,
         }
         if self.api_key:
             search_params["api_key"] = self.api_key
+        if self.email:
+            search_params["email"] = self.email
 
         try:
             search_response = requests.get(
                 "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
                 params=search_params,
+                headers=self.headers,
                 timeout=15,
             )
             search_response.raise_for_status()
-            root = ET.fromstring(search_response.text)
-            pmids = [item.text for item in root.findall(".//Id") if item.text]
+            content_type = search_response.headers.get("content-type", "")
+            if "json" not in content_type.lower():
+                snippet = " ".join(search_response.text[:300].split())
+                raise ValueError(f"NCBI esearch returned non-JSON response: {snippet}")
+
+            search_data = search_response.json()
+            pmids = search_data.get("esearchresult", {}).get("idlist", [])
             if not pmids:
                 return []
 
@@ -128,16 +176,23 @@ class PubMedSearcher:
                 "db": "pubmed",
                 "id": ",".join(pmids),
                 "retmode": "xml",
+                "tool": self.tool,
             }
             if self.api_key:
                 fetch_params["api_key"] = self.api_key
+            if self.email:
+                fetch_params["email"] = self.email
 
             fetch_response = requests.get(
                 "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi",
                 params=fetch_params,
+                headers=self.headers,
                 timeout=20,
             )
             fetch_response.raise_for_status()
+            if "<PubmedArticle" not in fetch_response.text and "<PubmedBookArticle" not in fetch_response.text:
+                snippet = " ".join(fetch_response.text[:300].split())
+                raise ValueError(f"NCBI efetch returned non-PubMed XML response: {snippet}")
             return self._parse_pubmed_xml(fetch_response.text)
         except Exception as exc:
             return [{"source": "PubMed", "id": "", "content": f"PubMed retrieval failed: {exc}"}]
@@ -355,9 +410,15 @@ class AMGKGSystem:
         max_entities: int = 6,
         max_retrieved_entities: int = 3,
         confidence_threshold: float = 0.8,
+        use_evidence_verifier: bool = False,
+        evidence_relevance_threshold: float = 0.8,
     ):
         self.llm = LLMFactory.create(provider, model)
-        self.pubmed = PubMedSearcher(api_key=config("pubmed_api", default=""))
+        self.pubmed = PubMedSearcher(
+            api_key=config("pubmed_api", default=""),
+            tool=config("NCBI_TOOL", default="AMG_RAG_project"),
+            email=config("NCBI_EMAIL", default=""),
+        )
         self.store = GlobalMKGStore(mkg_path)
         self.use_pubmed = use_pubmed
         self.use_wikipedia = use_wikipedia
@@ -365,14 +426,41 @@ class AMGKGSystem:
         self.max_entities = max_entities
         self.max_retrieved_entities = max_retrieved_entities
         self.confidence_threshold = confidence_threshold
+        self.use_evidence_verifier = use_evidence_verifier
+        self.evidence_relevance_threshold = evidence_relevance_threshold
         self.db = MedicalQAChromaDB() if use_vector_db and Path("new_VDB").exists() else None
+        self.llm_min_interval_seconds = float(config("LLM_MIN_INTERVAL_SECONDS", default="5"))
+        self.llm_max_retries = int(config("LLM_MAX_RETRIES", default="2"))
+        self.max_reasoning_trace_calls = int(config("MAX_REASONING_TRACE_CALLS", default="2"))
+        self.last_llm_request_time = 0.0
+
+    def throttle_llm(self) -> None:
+        elapsed = time.time() - self.last_llm_request_time
+        if elapsed < self.llm_min_interval_seconds:
+            time.sleep(self.llm_min_interval_seconds - elapsed)
+        self.last_llm_request_time = time.time()
 
     def invoke_json(self, prompt: str, fallback: Any) -> Any:
-        try:
-            response = self.llm.invoke(prompt)
-            return extract_json_object(llm_text(response), fallback)
-        except Exception:
-            return fallback
+        last_error = None
+        for attempt in range(self.llm_max_retries + 1):
+            try:
+                self.throttle_llm()
+                response = self.llm.invoke(prompt)
+                return extract_json_object(llm_text(response), fallback)
+            except Exception as exc:
+                last_error = exc
+                message = str(exc)
+                logging.exception("LLM JSON invocation failed")
+                if "429" not in message and "quota" not in message.lower() and "rate" not in message.lower():
+                    break
+                if attempt < self.llm_max_retries:
+                    time.sleep(65)
+
+        if isinstance(fallback, dict):
+            data = dict(fallback)
+            data["_error"] = str(last_error) if last_error else "Unknown LLM error"
+            return data
+        return fallback
 
     def retrieve_textbook_context(self, question: str, options: Dict[str, str]) -> str:
         if not self.db:
@@ -386,29 +474,201 @@ class AMGKGSystem:
             return ""
         return "\n\n".join(item[0].page_content for item in docs if item and item[0])[:5000]
 
-    def retrieve_external_context(self, terms: List[str]) -> List[Dict[str, str]]:
+    def evidence_relevance_score(self, item: Dict[str, str], term: str, question: str, options: Dict[str, str]) -> int:
+        item_text = " ".join([
+            item.get("title", ""),
+            item.get("content", ""),
+            item.get("journal", ""),
+        ])
+        item_tokens = keyword_tokens(item_text)
+        term_tokens = keyword_tokens(term)
+        question_tokens = keyword_tokens(question)
+        option_tokens = keyword_tokens(" ".join(options.values()) if isinstance(options, dict) else "")
+        return (
+            3 * len(item_tokens & term_tokens)
+            + 2 * len(item_tokens & question_tokens)
+            + len(item_tokens & option_tokens)
+        )
+
+    def generate_search_phrases(
+        self,
+        question: str,
+        options: Dict[str, str],
+        seed_entities: List[MedicalEntity],
+    ) -> List[str]:
+        entity_names = [entity.name for entity in seed_entities]
+        prompt = f"""
+Return only valid JSON.
+Generate up to 4 precise PubMed search phrases for this MEDQA question.
+The phrases should combine the core disease/drug/symptom/mechanism terms instead of using isolated entities.
+Prefer clinically specific phrases such as "cisplatin ototoxicity sensorineural hearing loss" over broad terms such as "cisplatin".
+Use answer options only to disambiguate the clinical concept; do not create a phrase from one answer option alone.
+Avoid generic patient words, ages, and irrelevant vitals.
+
+Schema:
+{{"search_phrases":["phrase 1","phrase 2"]}}
+
+Question:
+{question}
+
+Options:
+{json.dumps(options, ensure_ascii=False)}
+
+Seed entities:
+{json.dumps(entity_names, ensure_ascii=False)}
+"""
+        data = self.invoke_json(prompt, {"search_phrases": []})
+        phrases = []
+        seen = set()
+        for phrase in data.get("search_phrases", []) if isinstance(data, dict) else []:
+            phrase = re.sub(r"\s+", " ", str(phrase).strip())
+            key = normalize_name(phrase)
+            if not key or key in seen:
+                continue
+            if len(keyword_tokens(phrase)) < 2:
+                continue
+            seen.add(key)
+            phrases.append(phrase)
+            if len(phrases) >= 4:
+                break
+
+        if not phrases:
+            phrases = entity_names[: min(self.max_entities, 4)]
+        return phrases
+
+    def retrieve_external_context(
+        self,
+        terms: List[str],
+        question: str = "",
+        options: Optional[Dict[str, str]] = None,
+        max_total: int = 4,
+    ) -> List[Dict[str, str]]:
+        options = options or {}
         evidence = []
-        for term in terms[: self.max_entities]:
+        seen = set()
+        for term in terms[: min(self.max_entities, 4)]:
             pubmed_results = []
             if self.use_pubmed:
-                pubmed_results = [
-                    item for item in self.pubmed.search(term, max_results=1)
+                candidates = [
+                    item for item in self.pubmed.search(term, max_results=3)
                     if item.get("content") and not item.get("content", "").startswith("PubMed retrieval failed:")
                 ]
-                evidence.extend(pubmed_results)
+                scored = [
+                    (self.evidence_relevance_score(item, term, question, options), item)
+                    for item in candidates
+                ]
+                pubmed_results = [
+                    item for score, item in sorted(scored, key=lambda pair: pair[0], reverse=True)
+                    if score >= 3
+                ][:1]
+                for item in pubmed_results:
+                    item = dict(item)
+                    item["query"] = term
+                    key = item.get("pmid") or item.get("id") or item.get("title")
+                    if key and key not in seen:
+                        seen.add(key)
+                        evidence.append(item)
 
-            if not pubmed_results and self.use_wikipedia:
+            if len(evidence) >= max_total:
+                break
+
+            if not pubmed_results and self.use_wikipedia and len(evidence) < max_total:
                 try:
                     result = wikipedia.search(term, results=1)
                     if result:
-                        evidence.append({
+                        wiki_item = {
                             "source": "Wikipedia",
                             "id": result[0],
+                            "query": term,
                             "content": wikipedia.summary(result[0], sentences=2)[:1200],
-                        })
+                        }
+                        key = f"wiki:{result[0]}"
+                        if key not in seen and self.evidence_relevance_score(wiki_item, term, question, options) >= 3:
+                            seen.add(key)
+                            evidence.append(wiki_item)
                 except Exception:
                     pass
+        if self.use_evidence_verifier and evidence:
+            return self.verify_evidence_relevance(question, options, terms, evidence)
         return evidence
+
+    def verify_evidence_relevance(
+        self,
+        question: str,
+        options: Dict[str, str],
+        terms: List[str],
+        evidence: List[Dict[str, str]],
+    ) -> List[Dict[str, str]]:
+        evidence_payload = []
+        for index, item in enumerate(evidence):
+            evidence_payload.append({
+                "evidence_id": index,
+                "source": item.get("source", ""),
+                "id": item.get("pmid") or item.get("id", ""),
+                "title": item.get("title", ""),
+                "journal": item.get("journal", ""),
+                "year": item.get("year", ""),
+                "content": item.get("content", "")[:1200],
+            })
+
+        prompt = f"""
+Return only valid JSON.
+You are a strict medical evidence verifier for a MEDQA question.
+Score each evidence item for whether it is directly useful for answering the question.
+Use relevance_score from 0.0 to 1.0.
+Keep only evidence that directly discusses the patient's key condition, mechanism, diagnosis, treatment, adverse effect, or calculation needed by the question.
+Down-rank broad, tangential, unrelated, outdated, or search-term-only matches.
+Do not reward a paper just because it shares one keyword with the question.
+
+Schema:
+{{"evidence_scores":[{{"evidence_id":0, "relevance_score":0.0, "keep":false, "reason":"brief reason"}}]}}
+
+Question:
+{question}
+
+Options:
+{json.dumps(options, ensure_ascii=False)}
+
+Seed medical terms:
+{json.dumps(terms, ensure_ascii=False)}
+
+Evidence candidates:
+{json.dumps(evidence_payload, ensure_ascii=False)}
+"""
+        data = self.invoke_json(prompt, {"evidence_scores": []})
+        if isinstance(data, dict) and data.get("_error"):
+            return evidence
+
+        scores = {}
+        for item in data.get("evidence_scores", []):
+            if not isinstance(item, dict):
+                continue
+            try:
+                evidence_id = int(item.get("evidence_id"))
+            except (TypeError, ValueError):
+                continue
+            keep_value = item.get("keep", False)
+            if isinstance(keep_value, str):
+                keep = keep_value.strip().lower() in {"true", "yes", "1", "keep"}
+            else:
+                keep = bool(keep_value)
+            scores[evidence_id] = {
+                "relevance_score": float(item.get("relevance_score", 0.0) or 0.0),
+                "keep": keep,
+                "reason": item.get("reason", ""),
+            }
+
+        verified = []
+        for index, item in enumerate(evidence):
+            score = scores.get(index)
+            if not score:
+                continue
+            if score["keep"] and score["relevance_score"] >= self.evidence_relevance_threshold:
+                enriched = dict(item)
+                enriched["relevance_score"] = score["relevance_score"]
+                enriched["relevance_reason"] = score["reason"]
+                verified.append(enriched)
+        return verified
 
     def format_retrieved_papers(self, evidence: List[Dict[str, str]]) -> List[Dict[str, str]]:
         papers = []
@@ -483,7 +743,11 @@ class AMGKGSystem:
         )[:3000]
         prompt = f"""
 Return only valid JSON.
-Act as a Medical Entity Recognizer (MER). Extract the most important medical terms/entities from the question and options.
+Act as a Medical Entity Recognizer (MER). Extract the most important seed medical entities from the question stem.
+Use options only for disambiguation. Do not include answer choices as seed entities unless the same concept is explicitly mentioned in the question stem.
+Avoid incidental background conditions, demographics, normal vitals, and broad symptoms unless they are central to the diagnosis or management decision.
+Prefer specific diseases, drugs, mechanisms, procedures, pathogens, anatomy, adverse effects, and decisive clinical findings.
+Return at most {self.max_entities} entities, ordered by importance for answering the question.
 Use this schema:
 {{"entities":[{{"name":"...", "entity_type":"disease|drug|symptom|mechanism|treatment|finding|medical_concept", "description":"...", "confidence":0.0}}]}}
 
@@ -727,7 +991,8 @@ External evidence:
         textbook_context = self.retrieve_textbook_context(question, options)
         seed_entities = self.extract_entities(question, options)
         seed_entity_names = [entity.name for entity in seed_entities]
-        evidence = self.retrieve_external_context(seed_entity_names) if seed_entity_names else []
+        search_phrases = self.generate_search_phrases(question, options, seed_entities) if seed_entities else []
+        evidence = self.retrieve_external_context(search_phrases, question=question, options=options) if search_phrases else []
         retrieved_papers = self.format_retrieved_papers(evidence)
         seed_entities = self.enrich_entities(seed_entities, textbook_context, evidence)
         retrieved_entities = self.extract_retrieved_entities(seed_entities, textbook_context, evidence)
@@ -776,7 +1041,7 @@ External evidence:
             "answer_idx": question_data.get("answer_idx", ""),
             "answer": answer.get("answer", "NAN"),
             "confidence": answer.get("confidence", 0.0),
-            "explanation": answer.get("explanation", ""),
+            "explanation": answer.get("explanation", "") or answer.get("_error", ""),
             "reasoning": answer.get("reasoning", ""),
             "final_response": final_response,
             "reasoning_traces": reasoning_traces,
@@ -786,6 +1051,7 @@ External evidence:
             "search_context": evidence,
             "retrieved_papers": retrieved_papers,
             "medical_terms": seed_entity_names,
+            "search_phrases": search_phrases,
             "retrieved_entities": [asdict(entity) for entity in retrieved_entities],
             "documents": textbook_context,
             "graph_stats": {
@@ -842,6 +1108,12 @@ External evidence:
         data = self.invoke_json(prompt, {"answer": "NAN", "confidence": 0.0, "reasoning": "", "explanation": ""})
         answer = str(data.get("answer", "NAN")).strip().upper()
         match = re.search(r"\b([A-E])\b", answer)
+        if not match:
+            combined = " ".join([
+                str(data.get("reasoning", "")),
+                str(data.get("explanation", "")),
+            ])
+            match = re.search(r"(?:answer|option|choice)\s*[:\-]?\s*\(?([A-E])\)?", combined, flags=re.IGNORECASE)
         data["answer"] = match.group(1) if match else "NAN"
         data["confidence"] = float(data.get("confidence", 0.0) or 0.0)
         return data
@@ -872,7 +1144,10 @@ External evidence:
     ) -> List[Dict[str, str]]:
         evidence_text = "\n\n".join(f"[{item['source']} {item.get('id','')}] {item['content']}" for item in evidence)[:2500]
         traces = []
+        trace_calls = 0
         for entity in entities:
+            if trace_calls >= self.max_reasoning_trace_calls:
+                break
             summaries = self.collect_entity_graph_summaries(entity.name, graph_context)
             if not summaries:
                 continue
@@ -905,6 +1180,7 @@ External evidence:
             data = self.invoke_json(prompt, {"trace": ""})
             trace = str(data.get("trace", "")).strip() if isinstance(data, dict) else ""
             if trace:
+                trace_calls += 1
                 traces.append({
                     "entity": entity.name,
                     "trace": trace,
@@ -922,12 +1198,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run one AMG KG-RAG question from a MEDQA JSONL file.")
     parser.add_argument("--input", default="data_clean/data_clean/questions/US/test.jsonl")
     parser.add_argument("--index", type=int, default=0)
-    parser.add_argument("--provider", choices=["openai", "openai-compatible", "ollama"], default="ollama")
+    parser.add_argument("--provider", choices=["gemini", "openai", "openai-compatible", "openrouter", "ollama"], default="ollama")
     parser.add_argument("--model", default="llama3.1:8b")
     parser.add_argument("--mkg-path", default="artifacts/global_mkg.json")
     parser.add_argument("--no-pubmed", action="store_true")
     parser.add_argument("--no-wikipedia", action="store_true")
     parser.add_argument("--no-vector-db", action="store_true")
+    parser.add_argument("--verify-evidence", action="store_true")
+    parser.add_argument("--evidence-relevance-threshold", type=float, default=0.8)
     args = parser.parse_args()
 
     questions = load_jsonl(args.input)
@@ -938,6 +1216,8 @@ def main() -> None:
         use_pubmed=not args.no_pubmed,
         use_wikipedia=not args.no_wikipedia,
         use_vector_db=not args.no_vector_db,
+        use_evidence_verifier=args.verify_evidence,
+        evidence_relevance_threshold=args.evidence_relevance_threshold,
     )
     result = system.answer_question(questions[args.index])
     print(json.dumps(result, ensure_ascii=False, indent=2))

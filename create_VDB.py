@@ -2,7 +2,7 @@ import os
 import logging
 import argparse
 from sentence_transformers import SentenceTransformer
-from langchain.vectorstores import Chroma
+from langchain_chroma import Chroma
 import shutil  # For deleting directories
 
 class SentenceTransformerEmbedding:
@@ -59,12 +59,17 @@ class MedicalQAChromaDB:
             i += chunk_size - overlap
         return chunks
 
-    def store_embeddings_in_chroma(self, text_chunks, filename):
-        self.vectordb.add_texts(
-            texts=text_chunks,
-            metadatas=[{"filename": filename, "chunk_id": i} for i in range(len(text_chunks))],
-            ids=[f"{filename}_{i}" for i in range(len(text_chunks))]
-        )
+    def store_embeddings_in_chroma(self, text_chunks, filename, batch_size=1000):
+        print(f"Embedding {len(text_chunks)} chunks for file: {filename}")
+        for start in range(0, len(text_chunks), batch_size):
+            end = min(start + batch_size, len(text_chunks))
+            batch = text_chunks[start:end]
+            print(f"  Adding chunks {start + 1}-{end} of {len(text_chunks)}")
+            self.vectordb.add_texts(
+                texts=batch,
+                metadatas=[{"filename": filename, "chunk_id": i} for i in range(start, end)],
+                ids=[f"{filename}_{i}" for i in range(start, end)]
+            )
         print(f"Stored {len(text_chunks)} chunks for file: {filename}")
 
     def get_processed_files(self):
@@ -96,6 +101,7 @@ class MedicalQAChromaDB:
                 continue
 
             logging.info(f"Processing file: {filename}")
+            print(f"Processing file: {filename}")
             try:
                 text_chunks = self.split_text_into_chunks_with_overlap(text)
                 self.store_embeddings_in_chroma(text_chunks, filename)
@@ -103,7 +109,7 @@ class MedicalQAChromaDB:
                 logging.info(f"Successfully processed file: {filename}")
             except Exception as e:
                 logging.error(f"Error processing file {filename}: {e}")
-                break
+                raise
 
     def query_chroma(self, query_text, n_results=3):
         results = self.vectordb.similarity_search_with_score(query=query_text, k=n_results)

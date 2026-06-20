@@ -35,6 +35,7 @@ def result_to_row(result: Dict[str, Any], q_idx: int) -> Dict[str, Any]:
         "search_context": serialize(result.get("search_context", [])),
         "retrieved_papers": serialize(result.get("retrieved_papers", [])),
         "medical_terms": serialize(result.get("medical_terms", [])),
+        "search_phrases": serialize(result.get("search_phrases", [])),
         "graph_stats": serialize(result.get("graph_stats", {})),
         "documents": result.get("documents", ""),
     }
@@ -64,7 +65,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run paper-inspired AMG KG-RAG on MEDQA-style JSONL data.")
     parser.add_argument("--input", default="data_clean/data_clean/questions/US/test.jsonl")
     parser.add_argument("--output", default="results/medqa_kg.csv")
-    parser.add_argument("--provider", choices=["openai", "openai-compatible", "ollama"], default="ollama")
+    parser.add_argument("--provider", choices=["gemini", "openai", "openai-compatible", "openrouter", "ollama"], default="ollama")
     parser.add_argument("--model", default="llama3.1:8b")
     parser.add_argument("--mkg-path", default="artifacts/global_mkg.json")
     parser.add_argument("--limit", type=int, default=5, help="Use -1 for all questions.")
@@ -73,6 +74,8 @@ def main() -> None:
     parser.add_argument("--max-entities", type=int, default=6)
     parser.add_argument("--max-retrieved-entities", type=int, default=3)
     parser.add_argument("--confidence-threshold", type=float, default=0.8)
+    parser.add_argument("--verify-evidence", action="store_true")
+    parser.add_argument("--evidence-relevance-threshold", type=float, default=0.8)
     parser.add_argument("--no-pubmed", action="store_true")
     parser.add_argument("--no-wikipedia", action="store_true")
     parser.add_argument("--no-vector-db", action="store_true")
@@ -97,6 +100,8 @@ def main() -> None:
         max_entities=args.max_entities,
         max_retrieved_entities=args.max_retrieved_entities,
         confidence_threshold=args.confidence_threshold,
+        use_evidence_verifier=args.verify_evidence,
+        evidence_relevance_threshold=args.evidence_relevance_threshold,
     )
 
     rows = []
@@ -129,6 +134,7 @@ def main() -> None:
                 "search_context": "[]",
                 "retrieved_papers": "[]",
                 "medical_terms": "[]",
+                "search_phrases": "[]",
                 "graph_stats": "{}",
                 "documents": "",
             })

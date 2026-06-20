@@ -1,8 +1,46 @@
+# Secrets and local configuration
 .env
+.env.*
+!.env.example
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local datasets and generated stores
+data_clean/
 new_VDB/
+*.sqlite3
+*.db
+chroma.sqlite3
+
+# Experiment outputs and generated KG artifacts
 results/
 artifacts/
-processing_log.log
+
+# Logs and progress markers
+*.log
 processed_files.log
+processing_log.log
+
+# Local papers / assignment documents
+*.pdf
+*.docx
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+test.ipynb
